@@ -24,7 +24,7 @@
 - 内置工具固定为 `[]`
 - MCP 固定为空配置
 - 不加载本地 CodeBuddy 设置
-- 不持久化会话
+- 默认常驻三个彼此隔离的 CLI worker；请求之间执行 `/clear`，不落盘保存对话会话
 
 因此，数据库查询、Shell 命令、文件操作等工具必须由上游 Agent 接到 `tool_calls` 后在它自己的受控环境中执行。请始终设置 `PROXY_API_KEY`，并避免把服务端口直接暴露到公网。
 
@@ -38,6 +38,7 @@ npm install
 CODEBUDDY_API_KEY="你的 CodeBuddy API Key" \
 CODEBUDDY_INTERNET_ENVIRONMENT=internal \
 PROXY_API_KEY="替换为强随机密钥" \
+PERSISTENT_CLIENTS=3 \
 node server.js
 ```
 
@@ -63,6 +64,7 @@ docker run -d \
   -e CODEBUDDY_API_KEY="你的 CodeBuddy API Key" \
   -e CODEBUDDY_INTERNET_ENVIRONMENT=internal \
   -e PROXY_API_KEY="替换为强随机密钥" \
+  -e PERSISTENT_CLIENTS=3 \
   jobinbai/codebuddycli-proxy:latest
 ```
 
@@ -214,7 +216,18 @@ Authorization: Bearer <PROXY_API_KEY>
 | `DEFAULT_MODEL` | `auto` | 未知模型名时使用的模型。 |
 | `HIDE_REASONING` | `1` | 设为 `0` 时输出 `reasoning_content` 扩展字段；默认隐藏。 |
 | `REQUEST_TIMEOUT_MS` | `600000` | 单请求超时（毫秒）。 |
+| `QUEUE_TIMEOUT_MS` | `600000` | 等待可用 CLI worker 的最长时间（毫秒）。 |
+| `PERSISTENT_CLIENT` | `1` | 启用持久连接池；设为 `0` 时每次请求启动一次性 CLI。 |
+| `PERSISTENT_CLIENTS` | `3` | 常驻 CLI worker 数量，允许 1–32。 |
 | `WORK_DIR` | `~/.codebuddycli-proxy/workspace` | SDK 查询工作目录。 |
+
+## 持久连接池与并发
+
+服务启动时会并行预热 `PERSISTENT_CLIENTS` 个 CLI。默认三个 Agent 可同时生成；更多请求按 FIFO 排队。每个 worker 完成响应后执行 `/clear`，清理结束才重新进入可用队列。单个 worker 发生异常时只重建自身。
+
+`/health` 的 `persistent` 字段提供池大小、健康/可用/忙碌/清理/重建数量、排队深度，以及每个 worker 的状态、连接代次、请求数和预热耗时。请求时序日志还包含 `queue_wait_ms`、`backend_worker`、`backend_generation` 和 `backend_reused`。
+
+实测一个 CLI 约占 436 MB RSS；默认三个 worker 加 Node 主进程约需 1.37 GB。增加 `PERSISTENT_CLIENTS` 会近似线性增加内存。
 
 ## 故障排查
 

@@ -8,6 +8,8 @@ services:
       CODEBUDDY_API_KEY: "${CODEBUDDY_API_KEY:?Set CODEBUDDY_API_KEY in .env}"
       PROXY_API_KEY: "${PROXY_API_KEY:?Set PROXY_API_KEY in .env}"
       CODEBUDDY_INTERNET_ENVIRONMENT: "${CODEBUDDY_INTERNET_ENVIRONMENT:-internal}"
+      PERSISTENT_CLIENTS: "${PERSISTENT_CLIENTS:-3}"
+      QUEUE_TIMEOUT_MS: "${QUEUE_TIMEOUT_MS:-600000}"
     volumes:
       - codebuddy-workspace:/app/workspace
     healthcheck:
@@ -19,7 +21,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 60s
 
 volumes:
   codebuddy-workspace:

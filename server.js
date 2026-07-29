@@ -17,6 +17,9 @@
  *   CODEBUDDY_BIN       可选的 CodeBuddy CLI 绝对路径（默认使用 SDK 内置 CLI）
  *   DEFAULT_MODEL       未指定/未知模型时使用的模型（默认 "auto"）
  *   REQUEST_TIMEOUT_MS  单请求超时毫秒数（默认 600000）
+ *   QUEUE_TIMEOUT_MS    等待可用 CLI worker 的超时（默认 600000）
+ *   PERSISTENT_CLIENT   设为 0 时禁用持久连接池（默认启用）
+ *   PERSISTENT_CLIENTS  常驻 CLI worker 数量（默认 3）
  *   WORK_DIR            CLI 工作目录（默认 ~/.codebuddycli-proxy/workspace）
  */
 
@@ -27,8 +30,9 @@ const { randomUUID } = require('crypto');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
-const { query } = require('@tencent-ai/agent-sdk');
+const { query, unstable_v2_createSession: createSession } = require('@tencent-ai/agent-sdk');
 let queryImplementation = query;
+let sessionFactory = createSession;
 const SDK_CLI_PATH = path.resolve(path.dirname(require.resolve('@tencent-ai/agent-sdk')), '..', 'cli', 'bin', 'codebuddy');
 
 // ---------- 配置 ----------
@@ -46,6 +50,9 @@ const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
 const CODEBUDDY_BIN = process.env.CODEBUDDY_BIN || SDK_CLI_PATH;
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'auto';
 const REQUEST_TIMEOUT_MS = readPositiveInt('REQUEST_TIMEOUT_MS', 600000);
+const QUEUE_TIMEOUT_MS = readPositiveInt('QUEUE_TIMEOUT_MS', 600000);
+const PERSISTENT_CLIENT = process.env.PERSISTENT_CLIENT !== '0';
+const PERSISTENT_CLIENTS = readPositiveInt('PERSISTENT_CLIENTS', 3, 32);
 const WORK_DIR = process.env.WORK_DIR || path.join(os.homedir(), '.codebuddycli-proxy', 'workspace');
 // 是否隐藏推理模型的思考过程（reasoning_content）。默认隐藏：对外 API 不应暴露
 // 模型“我要执行 SQL / 运行命令”之类的 agentic 自言自语（虽无实际执行风险，但不专业且占带宽）。
@@ -73,6 +80,12 @@ const FUNCTION_MODE_GUARD = [
   '当前运行环境没有本地文件读写、命令行或编辑工具（不要用 <tool_call>、Write、Edit 等本地工具语法）。',
   '但你可以通过下方定义的“函数调用(function calling)”与外部系统交互、获取信息或执行操作。',
   '不要臆想你拥有数据库或命令行访问能力；只能通过已定义的函数调用与外部交互。',
+].join('\n');
+
+const PERSISTENT_SYSTEM_GUARD = [
+  '你正在通过一个 OpenAI 兼容代理处理相互独立的请求。',
+  '每次请求正文开头的【本次请求运行规则】只适用于该请求，必须严格遵守。',
+  '忽略此前请求的内容，不要使用未在本次请求中提供的上下文。',
 ].join('\n');
 
 // CLI 当前支持的模型（codebuddy --help 输出，未知模型将回退到 DEFAULT_MODEL）
@@ -160,7 +173,7 @@ function assistantToText(m) {
   return parts.join('\n');
 }
 
-/** 将 OpenAI messages[] 序列化为单条 prompt（CLI 每次请求无状态） */
+/** 将 OpenAI messages[] 序列化为完整 prompt；持久 worker 会在请求之间执行 /clear。 */
 function messagesToPrompt(messages) {
   const systems = [];
   const turns = [];
@@ -292,10 +305,18 @@ class ToolCallStripper {
           out += this.buf;
           this.buf = '';
         } else {
-          // 保留末尾少量字符，避免把 '<tool_call' 的开头截断到下一帧
-          const keep = Math.min(this.buf.length, 20);
+          // 只保留可能成为 '<tool_call' 前缀的后缀，普通文本立即透传。
+          const opening = '<tool_call';
+          let keep = 0;
+          const maximum = Math.min(this.buf.length, opening.length - 1);
+          for (let length = maximum; length > 0; length -= 1) {
+            if (opening.startsWith(this.buf.slice(-length))) {
+              keep = length;
+              break;
+            }
+          }
           out += this.buf.slice(0, this.buf.length - keep);
-          this.buf = this.buf.slice(this.buf.length - keep);
+          this.buf = keep ? this.buf.slice(-keep) : '';
         }
         break;
       }
@@ -517,23 +538,169 @@ class FunctionCallParser {
 
 // ---------- CodeBuddy SDK 执行核心 ----------
 
+function monotonicMs() {
+  return Number(process.hrtime.bigint()) / 1e6;
+}
+
+function roundMs(value) {
+  return value == null ? null : Math.round(value * 1000) / 1000;
+}
+
+class RequestTimingTrace {
+  constructor({
+    requestId,
+    model,
+    stream,
+    promptChars,
+    startedAtMs = monotonicMs(),
+    startedAt = new Date().toISOString(),
+    now = monotonicMs,
+    log = console.log,
+  }) {
+    this.requestId = requestId;
+    this.model = model;
+    this.stream = stream;
+    this.promptChars = promptChars;
+    this.startedAtMs = startedAtMs;
+    this.startedAt = startedAt;
+    this.now = now;
+    this.log = log;
+    this.finished = false;
+    this.marks = {
+      request_parsed_ms: this.elapsed(),
+      sdk_query_created_ms: null,
+      first_sdk_message_ms: null,
+      sdk_system_ms: null,
+      first_stream_event_ms: null,
+      first_text_delta_ms: null,
+      last_text_delta_ms: null,
+      assistant_ms: null,
+      result_ms: null,
+    };
+    this.streamEventCount = 0;
+    this.textDeltaCount = 0;
+    this.textDeltaChars = 0;
+    this.maxTextDeltaChars = 0;
+    this.maxTextDeltaGapMs = 0;
+    this.previousTextDeltaMs = null;
+    this.durationMs = null;
+    this.durationApiMs = null;
+    this.queueWaitMs = null;
+    this.backendWorker = null;
+    this.backendGeneration = null;
+    this.backendReused = null;
+  }
+
+  elapsed() {
+    return this.now() - this.startedAtMs;
+  }
+
+  markOnce(name, at = this.elapsed()) {
+    if (this.marks[name] == null) this.marks[name] = at;
+    return at;
+  }
+
+  markQueryCreated() {
+    this.markOnce('sdk_query_created_ms');
+  }
+
+  markBackendAcquired({ waitedMs, worker, generation, reused }) {
+    this.queueWaitMs = waitedMs;
+    this.backendWorker = worker;
+    this.backendGeneration = generation;
+    this.backendReused = reused;
+  }
+
+  observe(message) {
+    const at = this.elapsed();
+    this.markOnce('first_sdk_message_ms', at);
+
+    if (message.type === 'system') {
+      this.markOnce('sdk_system_ms', at);
+      return;
+    }
+    if (message.type === 'stream_event') {
+      this.streamEventCount += 1;
+      this.markOnce('first_stream_event_ms', at);
+      const event = message.event;
+      if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+        const chars = event.delta.text.length;
+        this.textDeltaCount += 1;
+        this.textDeltaChars += chars;
+        this.maxTextDeltaChars = Math.max(this.maxTextDeltaChars, chars);
+        this.markOnce('first_text_delta_ms', at);
+        this.marks.last_text_delta_ms = at;
+        if (this.previousTextDeltaMs != null) {
+          this.maxTextDeltaGapMs = Math.max(this.maxTextDeltaGapMs, at - this.previousTextDeltaMs);
+        }
+        this.previousTextDeltaMs = at;
+      }
+      return;
+    }
+    if (message.type === 'assistant') {
+      this.markOnce('assistant_ms', at);
+      return;
+    }
+    if (message.type === 'result') {
+      this.markOnce('result_ms', at);
+      this.durationMs = typeof message.duration_ms === 'number' ? message.duration_ms : null;
+      this.durationApiMs = typeof message.duration_api_ms === 'number' ? message.duration_api_ms : null;
+    }
+  }
+
+  finish(outcome) {
+    if (this.finished) return;
+    this.finished = true;
+    const totalMs = this.elapsed();
+    const firstTextMs = this.marks.first_text_delta_ms;
+    const lastTextMs = this.marks.last_text_delta_ms;
+    this.log(JSON.stringify({
+      event: 'codebuddy_request_timing',
+      timestamp: this.startedAt,
+      request_id: this.requestId,
+      model: this.model,
+      stream: this.stream,
+      outcome,
+      prompt_chars: this.promptChars,
+      queue_wait_ms: roundMs(this.queueWaitMs),
+      backend_worker: this.backendWorker,
+      backend_generation: this.backendGeneration,
+      backend_reused: this.backendReused,
+      total_ms: roundMs(totalMs),
+      ...Object.fromEntries(Object.entries(this.marks).map(([key, value]) => [key, roundMs(value)])),
+      text_stream_ms: firstTextMs != null && lastTextMs != null ? roundMs(lastTextMs - firstTextMs) : null,
+      stream_event_count: this.streamEventCount,
+      text_delta_count: this.textDeltaCount,
+      text_delta_chars: this.textDeltaChars,
+      max_text_delta_chars: this.maxTextDeltaChars,
+      max_text_delta_gap_ms: roundMs(this.maxTextDeltaGapMs),
+      duration_ms: this.durationMs,
+      duration_api_ms: this.durationApiMs,
+      non_api_ms: this.durationMs != null && this.durationApiMs != null
+        ? this.durationMs - this.durationApiMs
+        : null,
+    }));
+  }
+}
+
 /**
  * 通过官方 SDK 运行一个无状态查询。
- * 只消费 SDK 的 assistant/result 消息，不解析底层原始增量事件。
+ * 消费 SDK 的稳定消息与原始 text_delta 增量事件。
  */
-function runCodebuddy(prompt, model, handlers, systemPrompt) {
+function runCodebuddy(prompt, model, handlers, systemPrompt, timingTrace) {
   const controller = new AbortController();
   let settled = false;
   let cancelled = false;
   let sdkQuery;
-  const finishError = (err) => {
+  const finishError = (err, outcome = 'error') => {
     if (!settled && !cancelled) {
       settled = true;
+      timingTrace?.finish(outcome);
       handlers.onError && handlers.onError(err);
     }
   };
   const timer = setTimeout(() => {
-    finishError(new Error(`request timed out after ${REQUEST_TIMEOUT_MS}ms`));
+    finishError(new Error(`request timed out after ${REQUEST_TIMEOUT_MS}ms`), 'timeout');
     controller.abort();
     void sdkQuery?.interrupt();
   }, REQUEST_TIMEOUT_MS);
@@ -559,15 +726,25 @@ function runCodebuddy(prompt, model, handlers, systemPrompt) {
           extraArgs: {
             'no-session-persistence': null,
           },
-          // 关闭 SDK 的底层原始增量事件，仅消费稳定的 SDK 消息类型。
-          includePartialMessages: false,
-          systemPrompt: { append: systemPrompt || PURE_LLM_GUARD },
+          // 接收 SDK 的原始增量事件，以便将 text_delta 立即转发给 SSE 客户端。
+          // 稳定 assistant 消息仍会在结尾到达，供非流式请求和增量缺失时回退使用。
+          includePartialMessages: true,
+          // 覆盖 SDK 默认的编码 Agent 提示词：本服务是纯模型网关，默认提示词既无用
+          // 又会增加每次请求的上下文处理开销，并诱导模型尝试不可用的本地工具。
+          systemPrompt: systemPrompt || PURE_LLM_GUARD,
         },
       });
+      timingTrace?.markQueryCreated();
       activeQueries.add(sdkQuery);
       let gotResult = false;
       for await (const message of sdkQuery) {
-        if (message.type === 'assistant') {
+        timingTrace?.observe(message);
+        if (message.type === 'stream_event') {
+          const event = message.event;
+          if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+            handlers.onPartialTextDelta && handlers.onPartialTextDelta(event.delta.text);
+          }
+        } else if (message.type === 'assistant') {
           const text = message.message.content
             .filter((block) => block.type === 'text')
             .map((block) => block.text)
@@ -584,9 +761,10 @@ function runCodebuddy(prompt, model, handlers, systemPrompt) {
         } else if (message.type === 'result') {
           gotResult = true;
           if (message.is_error) {
-            finishError(new Error(message.errors?.join('; ') || `CodeBuddy ${message.subtype}`));
+            finishError(new Error(message.errors?.join('; ') || `CodeBuddy ${message.subtype}`), 'sdk_error');
           } else if (!settled) {
             settled = true;
+            timingTrace?.finish('success');
             handlers.onResult && handlers.onResult(message);
           }
         }
@@ -607,11 +785,420 @@ function runCodebuddy(prompt, model, handlers, systemPrompt) {
     kill() {
       cancelled = true;
       clearTimeout(timer);
+      timingTrace?.finish('cancelled');
       controller.abort();
       void sdkQuery?.interrupt();
       void task.catch(() => {});
     },
   };
+}
+
+class PoolQueueTimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'PoolQueueTimeoutError';
+    this.statusCode = 503;
+  }
+}
+
+async function persistentPrompt(prompt, systemPrompt, sessionId) {
+  const prefix = `【本次请求运行规则】\n${systemPrompt}\n\n【本次请求内容】\n`;
+  if (typeof prompt === 'string') return prefix + prompt;
+  if (!prompt || typeof prompt[Symbol.asyncIterator] !== 'function') {
+    throw new Error('unsupported persistent prompt type');
+  }
+  const iterator = prompt[Symbol.asyncIterator]();
+  const { value, done } = await iterator.next();
+  if (done || !value?.message) throw new Error('image prompt stream produced no user message');
+  const content = Array.isArray(value.message.content)
+    ? value.message.content.map((block) => ({ ...block }))
+    : [{ type: 'text', text: String(value.message.content || '') }];
+  const textBlock = content.find((block) => block?.type === 'text');
+  if (textBlock) textBlock.text = prefix + String(textBlock.text || '');
+  else content.unshift({ type: 'text', text: prefix });
+  if (typeof iterator.return === 'function') await iterator.return();
+  return {
+    ...value,
+    session_id: sessionId,
+    message: { ...value.message, content },
+  };
+}
+
+class PersistentSessionPool {
+  constructor({
+    size = PERSISTENT_CLIENTS,
+    queueTimeoutMs = QUEUE_TIMEOUT_MS,
+    requestTimeoutMs = REQUEST_TIMEOUT_MS,
+    create = (options) => sessionFactory(options),
+    rebuildDelayMs = 5000,
+  } = {}) {
+    this.size = size;
+    this.queueTimeoutMs = queueTimeoutMs;
+    this.requestTimeoutMs = requestTimeoutMs;
+    this.create = create;
+    this.rebuildDelayMs = rebuildDelayMs;
+    this.available = [];
+    this.waiters = [];
+    this.stopping = false;
+    this.workers = Array.from({ length: size }, (_, index) => ({
+      id: index + 1,
+      state: 'warming',
+      session: null,
+      generation: 0,
+      servedRequests: 0,
+      warmupMs: null,
+      durationApiBaseline: 0,
+      maintenance: null,
+    }));
+    this.activeSessions = new Set();
+  }
+
+  get status() {
+    const count = (state) => this.workers.filter((worker) => worker.state === state).length;
+    const available = count('ready');
+    const busy = count('busy');
+    const cleaning = count('cleaning');
+    const warming = count('warming');
+    const rebuilding = count('rebuilding');
+    const healthy = available + busy + cleaning;
+    return {
+      mode: 'persistent_pool',
+      pool_size: this.size,
+      ready: healthy === this.size,
+      healthy,
+      available,
+      busy,
+      cleaning,
+      warming,
+      rebuilding,
+      queued_requests: this.waiters.length,
+      workers: this.workers.map((worker) => ({
+        id: worker.id,
+        state: worker.state,
+        generation: worker.generation,
+        served_requests: worker.servedRequests,
+        warmup_ms: roundMs(worker.warmupMs),
+      })),
+    };
+  }
+
+  sessionOptions() {
+    return {
+      cwd: WORK_DIR,
+      env: buildCleanEnv(),
+      model: DEFAULT_MODEL,
+      sessionId: `proxy-${randomUUID()}`,
+      pathToCodebuddyCode: CODEBUDDY_BIN,
+      settingSources: [],
+      strictMcpConfig: true,
+      mcpServers: {},
+      tools: [],
+      permissionMode: 'default',
+      extraArgs: { 'no-session-persistence': null },
+      includePartialMessages: true,
+      systemPrompt: PERSISTENT_SYSTEM_GUARD,
+    };
+  }
+
+  async start() {
+    const results = await Promise.allSettled(this.workers.map((worker) => this.connectWorker(worker)));
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        const worker = this.workers[index];
+        console.error(`persistent worker ${worker.id} warm-up failed; rebuilding in background: ${result.reason?.message || result.reason}`);
+        this.scheduleRebuild(worker, this.rebuildDelayMs);
+      }
+    });
+  }
+
+  async connectWorker(worker) {
+    const started = monotonicMs();
+    worker.state = worker.generation === 0 ? 'warming' : 'rebuilding';
+    const session = this.create(this.sessionOptions());
+    try {
+      worker.durationApiBaseline = 0;
+      await session.connect();
+      await session.send('/clear');
+      await this.drainMaintenance(worker, session);
+    } catch (err) {
+      try { session.close(); } catch {}
+      worker.session = null;
+      worker.state = 'rebuilding';
+      throw err;
+    }
+    worker.session = session;
+    worker.generation += 1;
+    worker.state = 'ready';
+    worker.warmupMs = monotonicMs() - started;
+    this.releaseWorker(worker);
+    console.log(JSON.stringify({
+      event: 'codebuddy_persistent_ready',
+      worker: worker.id,
+      generation: worker.generation,
+      warmup_ms: roundMs(worker.warmupMs),
+    }));
+  }
+
+  async drainMaintenance(worker, session) {
+    for await (const message of session.stream()) {
+      if (message.type === 'result' && typeof message.duration_api_ms === 'number') {
+        worker.durationApiBaseline = message.duration_api_ms;
+      }
+    }
+  }
+
+  acquireWorker(signal) {
+    const started = monotonicMs();
+    if (this.available.length > 0) {
+      const worker = this.available.shift();
+      worker.state = 'busy';
+      return Promise.resolve({ worker, waitedMs: monotonicMs() - started });
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const waiter = {
+        resolve: (worker) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+          worker.state = 'busy';
+          resolve({ worker, waitedMs: monotonicMs() - started });
+        },
+        reject: (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+          reject(err);
+        },
+      };
+      const removeWaiter = () => {
+        const index = this.waiters.indexOf(waiter);
+        if (index >= 0) this.waiters.splice(index, 1);
+      };
+      const onAbort = () => {
+        removeWaiter();
+        waiter.reject(new Error('request cancelled while waiting for a CodeBuddy worker'));
+      };
+      const timer = setTimeout(() => {
+        removeWaiter();
+        waiter.reject(new PoolQueueTimeoutError(
+          `no CodeBuddy CLI worker became available within ${this.queueTimeoutMs}ms`
+        ));
+      }, this.queueTimeoutMs);
+      timer.unref?.();
+      if (signal?.aborted) return onAbort();
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.waiters.push(waiter);
+    });
+  }
+
+  releaseWorker(worker) {
+    if (this.stopping) return;
+    const waiter = this.waiters.shift();
+    if (waiter) waiter.resolve(worker);
+    else {
+      worker.state = 'ready';
+      this.available.push(worker);
+    }
+  }
+
+  async discardWorker(worker) {
+    const session = worker.session;
+    worker.session = null;
+    worker.state = this.stopping ? 'stopped' : 'rebuilding';
+    worker.durationApiBaseline = 0;
+    if (session) {
+      this.activeSessions.delete(session);
+      try { session.close(); } catch {}
+    }
+  }
+
+  trackMaintenance(worker, promise) {
+    worker.maintenance = promise;
+    promise.finally(() => {
+      if (worker.maintenance === promise) worker.maintenance = null;
+    }).catch(() => {});
+  }
+
+  scheduleCleanup(worker, session, generation) {
+    const promise = (async () => {
+      worker.state = 'cleaning';
+      try {
+        await session.send('/clear');
+        await this.drainMaintenance(worker, session);
+        if (this.stopping || worker.session !== session || worker.generation !== generation) return;
+        this.releaseWorker(worker);
+      } catch (err) {
+        console.error(`persistent worker ${worker.id} clear failed; rebuilding: ${err?.message || err}`);
+        await this.discardWorker(worker);
+        worker.maintenance = null;
+        this.scheduleRebuild(worker);
+      }
+    })();
+    this.trackMaintenance(worker, promise);
+  }
+
+  scheduleRebuild(worker, delayMs = 0) {
+    if (this.stopping) return;
+    const current = worker.maintenance;
+    if (current) return;
+    const promise = (async () => {
+      let delay = delayMs;
+      while (!this.stopping) {
+        if (delay > 0) {
+          await new Promise((resolve) => {
+            const timer = setTimeout(resolve, delay);
+            timer.unref?.();
+          });
+        }
+        try {
+          await this.connectWorker(worker);
+          return;
+        } catch (err) {
+          console.error(`persistent worker ${worker.id} rebuild failed; retrying: ${err?.message || err}`);
+          delay = Math.min(Math.max(delay * 2, this.rebuildDelayMs), 60000);
+        }
+      }
+    })();
+    this.trackMaintenance(worker, promise);
+  }
+
+  run(prompt, model, handlers, systemPrompt, timingTrace) {
+    const controller = new AbortController();
+    let session = null;
+    let cancelled = false;
+    let settled = false;
+    let requestTimer = null;
+
+    const finishError = (err, outcome = 'error') => {
+      if (!settled && !cancelled) {
+        settled = true;
+        timingTrace?.finish(outcome);
+        handlers.onError?.(err);
+      }
+    };
+
+    const task = (async () => {
+      let worker = null;
+      let completed = false;
+      try {
+        const leased = await this.acquireWorker(controller.signal);
+        worker = leased.worker;
+        session = worker.session;
+        if (!session) throw new Error('leased CodeBuddy worker has no session');
+        timingTrace?.markBackendAcquired({
+          waitedMs: leased.waitedMs,
+          worker: worker.id,
+          generation: worker.generation,
+          reused: worker.servedRequests > 0,
+        });
+        requestTimer = setTimeout(() => {
+          finishError(new Error(`request timed out after ${this.requestTimeoutMs}ms`), 'timeout');
+          controller.abort();
+          void session?.interrupt();
+        }, this.requestTimeoutMs);
+        requestTimer.unref?.();
+        this.activeSessions.add(session);
+        await session.setModel(model);
+        await session.send(await persistentPrompt(prompt, systemPrompt || PURE_LLM_GUARD, session.sessionId));
+        timingTrace?.markQueryCreated();
+        let gotResult = false;
+        for await (let message of session.stream()) {
+          if (message.type === 'result' && typeof message.duration_api_ms === 'number') {
+            const currentApiMs = message.duration_api_ms;
+            message = {
+              ...message,
+              duration_api_ms: Math.max(0, currentApiMs - worker.durationApiBaseline),
+            };
+            worker.durationApiBaseline = currentApiMs;
+          }
+          timingTrace?.observe(message);
+          if (message.type === 'stream_event') {
+            const event = message.event;
+            if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+              handlers.onPartialTextDelta?.(event.delta.text);
+            }
+          } else if (message.type === 'assistant') {
+            const text = message.message.content
+              .filter((block) => block.type === 'text')
+              .map((block) => block.text)
+              .join('');
+            const thinking = message.message.content
+              .filter((block) => block.type === 'thinking')
+              .map((block) => block.thinking)
+              .join('');
+            if (text) handlers.onTextDelta?.(text);
+            if (thinking) handlers.onThinkingDelta?.(thinking);
+            if (message.message.stop_reason) {
+              handlers.onStopReason?.(message.message.stop_reason, message.message.usage);
+            }
+          } else if (message.type === 'result') {
+            gotResult = true;
+            completed = true;
+            worker.servedRequests += 1;
+            if (!settled) {
+              settled = true;
+              timingTrace?.finish('success');
+              handlers.onResult?.(message);
+            }
+          }
+        }
+        if (!gotResult) throw new Error('CodeBuddy SDK session ended without a result message');
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        finishError(
+          err instanceof PoolQueueTimeoutError
+            ? err
+            : new Error(`CodeBuddy SDK request failed: ${detail}`),
+          err instanceof PoolQueueTimeoutError ? 'queue_timeout' : 'error'
+        );
+      } finally {
+        if (requestTimer) clearTimeout(requestTimer);
+        if (session) this.activeSessions.delete(session);
+        if (worker) {
+          if (completed && worker.session === session) {
+            this.scheduleCleanup(worker, session, worker.generation);
+          } else {
+            await this.discardWorker(worker);
+            this.scheduleRebuild(worker);
+          }
+        }
+        handlers.onExit?.();
+      }
+    })();
+
+    return {
+      done: task,
+      kill() {
+        cancelled = true;
+        controller.abort();
+        if (requestTimer) clearTimeout(requestTimer);
+        timingTrace?.finish('cancelled');
+        void session?.interrupt();
+        void task.catch(() => {});
+      },
+    };
+  }
+
+  async stop() {
+    this.stopping = true;
+    const error = new Error('CodeBuddy pool is shutting down');
+    for (const waiter of this.waiters.splice(0)) waiter.reject(error);
+    for (const session of this.activeSessions) {
+      try { await session.interrupt(); } catch {}
+    }
+    await Promise.all(this.workers.map((worker) => this.discardWorker(worker)));
+  }
+}
+
+const persistentPool = new PersistentSessionPool();
+
+function runBackend(prompt, model, handlers, systemPrompt, timingTrace) {
+  return PERSISTENT_CLIENT
+    ? persistentPool.run(prompt, model, handlers, systemPrompt, timingTrace)
+    : runCodebuddy(prompt, model, handlers, systemPrompt, timingTrace);
 }
 
 // ---------- 路由处理 ----------
@@ -636,6 +1223,8 @@ function handleModels(res) {
 }
 
 async function handleChatCompletions(req, res) {
+  const requestStartedAtMs = monotonicMs();
+  const requestStartedAt = new Date().toISOString();
   let body;
   try {
     body = JSON.parse((await readBody(req)) || '{}');
@@ -673,6 +1262,14 @@ async function handleChatCompletions(req, res) {
 
   const completionId = `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
+  const timingTrace = new RequestTimingTrace({
+    requestId: completionId,
+    model,
+    stream,
+    promptChars: prompt.length,
+    startedAtMs: requestStartedAtMs,
+    startedAt: requestStartedAt,
+  });
 
   console.log(`[${new Date().toISOString()}] chat.completions model=${model} stream=${stream} promptChars=${prompt.length}`);
 
@@ -717,6 +1314,7 @@ async function handleChatCompletions(req, res) {
     let hasToolCalls = false;
     let toolCallIndex = 0;
     let functionTextAcc = '';
+    let receivedPartialText = false;
 
     const onToolCall = (call) => {
       if (finished) return;
@@ -739,13 +1337,21 @@ async function handleChatCompletions(req, res) {
       ? new FunctionCallParser(knownNames, onContent, onToolCall)
       : new ToolCallStripper();
 
-    const proc = runCodebuddy(backendPrompt, model, {
+    const proc = runBackend(backendPrompt, model, {
+      onPartialTextDelta(text) {
+        // 函数调用保留完整稳定消息后再解析，避免把未闭合的调用标签泄露出去。
+        if (finished || functionMode || !text) return;
+        receivedPartialText = true;
+        const clean = parser.push(text);
+        if (clean) sendChunk({ content: clean });
+      },
       onTextDelta(text) {
         if (!finished) {
           if (functionMode) {
             // SDK 以完整 assistant 消息交付文本；等到 result 时统一解析，避免原始工具标签泄露。
             functionTextAcc += text;
-          } else {
+          } else if (!receivedPartialText) {
+            // 未收到 SDK 增量事件时回退到稳定消息，避免兼容性问题导致空响应。
             const clean = parser.push(text);
             if (clean) sendChunk({ content: clean });
           }
@@ -800,7 +1406,7 @@ async function handleChatCompletions(req, res) {
           res.end();
         }
       },
-    }, systemPrompt);
+    }, systemPrompt, timingTrace);
 
     req.on('close', () => {
       if (!finished) {
@@ -814,7 +1420,7 @@ async function handleChatCompletions(req, res) {
     let textAcc = '';
     let stopReason = 'stop';
 
-    const proc = runCodebuddy(backendPrompt, model, {
+    const proc = runBackend(backendPrompt, model, {
       onTextDelta(t) { textAcc += t; },
       onStopReason(r) { stopReason = mapStopReason(r); },
       onResult(evt) {
@@ -866,9 +1472,9 @@ async function handleChatCompletions(req, res) {
       onError(err) {
         if (responded) return;
         responded = true;
-        openaiError(res, 500, err.message, 'server_error');
+        openaiError(res, err.statusCode || 500, err.message, 'server_error');
       },
-    }, systemPrompt);
+    }, systemPrompt, timingTrace);
 
     req.on('close', () => {
       if (!responded) proc.kill();
@@ -895,7 +1501,15 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url === '/health' || url === '/v1/health') {
-    return sendJson(res, 200, { status: 'ok', backend: 'codebuddy-agent-sdk', tools: 'disabled', reasoning: HIDE_REASONING ? 'hidden' : 'visible' });
+    return sendJson(res, 200, {
+      status: 'ok',
+      backend: 'codebuddy-agent-sdk',
+      tools: 'disabled',
+      reasoning: HIDE_REASONING ? 'hidden' : 'visible',
+      persistent: PERSISTENT_CLIENT
+        ? persistentPool.status
+        : { mode: 'one_shot', ready: true },
+    });
   }
 
   if (!checkAuth(req)) {
@@ -919,7 +1533,8 @@ const server = http.createServer(async (req, res) => {
   openaiError(res, 404, `Unknown route: ${req.method} ${url}`);
 });
 
-function startServer() {
+async function startServer() {
+  if (PERSISTENT_CLIENT) await persistentPool.start();
   server.listen(PORT, HOST, () => {
     console.log('╭──────────────────────────────────────────────────╮');
     console.log('│  codebuddycli-proxy — OpenAI-compatible gateway   │');
@@ -927,6 +1542,7 @@ function startServer() {
     console.log(`  Listening : http://${HOST}:${PORT}`);
     console.log(`  Endpoints : POST /v1/chat/completions | GET /v1/models | GET /health`);
     console.log(`  Backend   : CodeBuddy Agent SDK (models: ${KNOWN_MODELS.join(', ')})`);
+    console.log(`  CLI pool  : ${PERSISTENT_CLIENT ? `${PERSISTENT_CLIENTS} persistent worker(s)` : 'one-shot queries'}`);
     console.log(`  Auth      : ${PROXY_API_KEY ? 'Bearer key required' : 'disabled (local use)'}`);
     console.log('  CLI tools : disabled (tool calls are returned to the upstream agent)');
     console.log(`  Reasoning : ${HIDE_REASONING ? 'hidden (set HIDE_REASONING=0 to show)' : 'visible (reasoning_content)'}`);
@@ -934,11 +1550,12 @@ function startServer() {
   });
 }
 
-function shutdown(signal) {
+async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\n${signal} received; aborting ${activeQueries.size} active request(s)...`);
   for (const sdkQuery of activeQueries) void sdkQuery.interrupt();
+  if (PERSISTENT_CLIENT) await persistentPool.stop();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10_000).unref();
 }
@@ -946,15 +1563,25 @@ function shutdown(signal) {
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
 
-if (require.main === module) startServer();
+if (require.main === module) {
+  startServer().catch((err) => {
+    console.error(`Failed to start server: ${err?.stack || err}`);
+    process.exit(1);
+  });
+}
 
 module.exports = {
   FunctionCallParser,
+  PersistentSessionPool,
+  PoolQueueTimeoutError,
+  RequestTimingTrace,
   ToolCallStripper,
   extractFunctionCalls,
   messagesToPrompt,
   normalizeFunctions,
   runCodebuddy,
+  runBackend,
+  setSessionFactory(implementation) { sessionFactory = implementation || createSession; },
   setQueryImplementation(implementation) { queryImplementation = implementation || query; },
   stripToolCallsOnce,
   usageToOpenAI,
