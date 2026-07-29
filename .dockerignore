@@ -1,0 +1,11 @@
+node_modules
+.git
+.agents
+.codex
+CODE_ANALYSIS.md
+CODE_ANALYSIS_DOCS.md
+docs
+test
+npm-debug.log*
+.env
+.env.*

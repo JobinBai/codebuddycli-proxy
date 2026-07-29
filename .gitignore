@@ -1,0 +1,22 @@
+# 运行时工作目录（CLI 会话落地内容，位于用户 home，非项目文件）
+# 如在本仓库内产生，忽略之
+/workspace/
+
+# 本地记忆 / 项目元数据（非源码）
+.workbuddy/
+
+# 密钥 / 环境变量（切勿提交 API Key）
+.env
+.env.*
+*.local
+
+# 日志 / 临时
+*.log
+/tmp/
+.DS_Store
+
+# npm link 本地占位（全局 bin 指向源码的符号链接，非依赖）
+node_modules/
+
+DOCKERHUB.md
+docs/*
