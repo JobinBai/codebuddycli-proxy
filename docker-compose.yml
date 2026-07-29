@@ -1,0 +1,25 @@
+services:
+  codebuddycli-proxy:
+    image: jobinbai/codebuddycli-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8787}:8787"
+    environment:
+      CODEBUDDY_API_KEY: "${CODEBUDDY_API_KEY:?Set CODEBUDDY_API_KEY in .env}"
+      PROXY_API_KEY: "${PROXY_API_KEY:?Set PROXY_API_KEY in .env}"
+      CODEBUDDY_INTERNET_ENVIRONMENT: "${CODEBUDDY_INTERNET_ENVIRONMENT:-internal}"
+    volumes:
+      - codebuddy-workspace:/app/workspace
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  codebuddy-workspace:
