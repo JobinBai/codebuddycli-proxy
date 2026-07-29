@@ -1,5 +1,7 @@
 # codebuddycli-proxy
 
+[![Docker Hub](https://img.shields.io/docker/v/jobinbai/codebuddycli-proxy?label=Docker%20Hub)](https://hub.docker.com/r/jobinbai/codebuddycli-proxy)
+
 将 CodeBuddy Agent SDK 封装为 **OpenAI Chat Completions 兼容 API**，供 Cherry Studio、OpenAI SDK、LangChain 等客户端或 Agent 接入。
 
 它是一个纯模型网关：服务端不执行命令、读写文件、调用 MCP 或访问数据库。若模型请求工具，代理只返回标准 OpenAI `tool_calls`；由接入该 API 的 Agent 在自己的环境中决定是否执行。
