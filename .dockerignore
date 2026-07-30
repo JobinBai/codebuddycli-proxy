@@ -1,4 +1,6 @@
 node_modules
+package.json
+package-lock.json
 .git
 .agents
 .codex
@@ -6,6 +8,8 @@ CODE_ANALYSIS.md
 CODE_ANALYSIS_DOCS.md
 docs
 test
+README.md
+DOCKERHUB.md
 npm-debug.log*
 .env
 .env.*

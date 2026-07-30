@@ -1,17 +1,14 @@
-FROM node:22-bookworm-slim
+FROM node:24-alpine
 
 WORKDIR /app
 
-RUN chown node:node /app
-
-USER node
-
-# 直连版无运行时依赖（仅用 Node 内置模块），无需 npm install
-COPY --chown=node:node package.json ./
+# 直连版只使用 Node 内置模块：镜像不包含 npm 依赖、包清单或锁文件。
 COPY --chown=node:node server.js ./
 COPY --chown=node:node lib/ ./lib/
 
-RUN mkdir -p /app/workspace
+RUN mkdir -p /app/workspace && chown -R node:node /app
+
+USER node
 
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \

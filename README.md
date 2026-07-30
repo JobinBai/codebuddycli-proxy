@@ -233,4 +233,4 @@ npm test
 node --check server.js
 ```
 
-项目使用官方 `@tencent-ai/agent-sdk`，其内置 CodeBuddy CLI，无需单独安装全局 CodeBuddy 命令。
+项目为纯 Node.js 直连实现：不依赖 Agent SDK、CodeBuddy CLI 或第三方运行时包。
