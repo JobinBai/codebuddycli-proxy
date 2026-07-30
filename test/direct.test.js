@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   buildHeaders,
+  AXIOS_USER_AGENT,
   decodeJwtPayload,
   deriveIdentity,
   isTokenExpired,
@@ -79,13 +80,12 @@ test('builds the full CLI header set with identity derived from the token', () =
   assert.equal(headers['x-user-id'], '81919ef5-8ec1-4c89-9ae6-91f592b9845c');
   assert.equal(headers['x-domain'], 'www.codebuddy.cn');
   assert.equal(headers['x-product'], 'SaaS');
-  assert.equal(headers['x-codebuddy-request'], '1');
   assert.equal(headers['x-agent-intent'], 'craft');
   assert.equal(headers['x-agent-purpose'], 'conversation');
   assert.equal(headers['x-ide-type'], 'CLI');
   assert.equal(headers['x-private-data'], 'false');
   assert.equal(headers['x-requested-with'], 'XMLHttpRequest');
-  assert.match(headers['user-agent'], /^CLI\/[\d.]+ CodeBuddy\/[\d.]+$/);
+  assert.equal(headers['user-agent'], AXIOS_USER_AGENT);
   // JWT 模式不应出现 X-API-Key
   assert.equal(headers['x-api-key'], undefined);
 });
@@ -141,6 +141,7 @@ test('header insertion order matches the captured CLI request', () => {
     'x-stainless-os',
     'x-stainless-package-version',
     'x-stainless-retry-count',
+    'x-stainless-timeout',
     'x-stainless-runtime',
     'x-stainless-runtime-version',
     'x-conversation-id',
@@ -151,13 +152,12 @@ test('header insertion order matches the captured CLI request', () => {
     'x-ide-name',
     'x-ide-version',
     'x-private-data',
-    'x-codebuddy-request',
     'x-request-id',
     'x-conversation-message-id',
     'traceparent',
   ];
   assert.deepEqual(keys.slice(0, expectedHead.length), expectedHead);
-  // user-agent 恒为最后一个，与抓包一致
+  // Axios adapter 补入的 UA 是最后一个
   assert.equal(keys[keys.length - 1], 'user-agent');
 });
 
@@ -262,8 +262,19 @@ test('normalizes duplicated chat/completions suffixes', () => {
   assert.equal(normalizeChatCompletionsUrl('https://x/v2?a=1'), 'https://x/v2/chat/completions?a=1');
 });
 
-test('defaults to the internal copilot endpoint', () => {
-  assert.equal(resolveEndpoint(), 'https://copilot.tencent.com/v2/chat/completions');
+test('uses the CLI product endpoint selected by CODEBUDDY_INTERNET_ENVIRONMENT', () => {
+  const before = process.env.CODEBUDDY_INTERNET_ENVIRONMENT;
+  try {
+    process.env.CODEBUDDY_INTERNET_ENVIRONMENT = 'internal';
+    assert.equal(resolveEndpoint(), 'https://copilot.tencent.com/v2/chat/completions');
+    process.env.CODEBUDDY_INTERNET_ENVIRONMENT = 'ioa';
+    assert.equal(resolveEndpoint(), 'https://copilot.tencent.com/v2/chat/completions');
+    delete process.env.CODEBUDDY_INTERNET_ENVIRONMENT;
+    assert.equal(resolveEndpoint(), 'https://www.codebuddy.ai/v2/chat/completions');
+  } finally {
+    if (before === undefined) delete process.env.CODEBUDDY_INTERNET_ENVIRONMENT;
+    else process.env.CODEBUDDY_INTERNET_ENVIRONMENT = before;
+  }
   assert.equal(resolveEndpoint('http://127.0.0.1:9099/v2'), 'http://127.0.0.1:9099/v2/chat/completions');
 });
 
@@ -399,7 +410,8 @@ test('client sends the simulated headers upstream', async () => {
   await client.createCompletion({ model: 'hy3', messages: [] }, { session: new Session('k') });
 
   assert.equal(sent['x-user-id'], '81919ef5-8ec1-4c89-9ae6-91f592b9845c');
-  assert.equal(sent['x-codebuddy-request'], '1');
+  assert.equal(sent['x-stainless-timeout'], '600');
+  assert.equal(sent['user-agent'], AXIOS_USER_AGENT);
   assert.ok(sent.traceparent.startsWith('00-'));
 });
 

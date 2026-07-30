@@ -138,11 +138,10 @@ test('发出请求时完整模拟 CLI 请求头', async () => {
   assert.strictEqual(h['x-stainless-lang'], 'js');
   assert.strictEqual(h['x-stainless-runtime'], 'node');
   assert.strictEqual(h['x-private-data'], 'false');
-  assert.strictEqual(h['x-codebuddy-request'], '1');
   assert.strictEqual(h['x-ide-type'], 'CLI');
   assert.strictEqual(h['x-agent-intent'], 'craft');
   assert.strictEqual(h['x-agent-purpose'], 'conversation');
-  assert.ok(h['user-agent'].endsWith(`CodeBuddy/${h['x-ide-version']}`), 'user-agent 尾部');
+  assert.strictEqual(h['user-agent'], 'axios/1.18.1');
 
   // 上游强制流式，即便调用方没要求
   assert.strictEqual(capturedRequests[0].body.stream, true);
@@ -279,4 +278,3 @@ test('流式输出忠实透传 system_fingerprint 与 usage', async () => {
   // stream_options 透传到上游
   assert.deepStrictEqual(capturedRequests[0].body.stream_options, { include_usage: true });
 });
-

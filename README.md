@@ -40,7 +40,7 @@ node server.js
 
 服务默认监听 `http://127.0.0.1:8787`。
 
-`CODEBUDDY_API_KEY` 为认证令牌；`CODEBUDDY_BASE_URL` 可覆盖上游地址（默认 `https://copilot.tencent.com/v2`）。该部署方式只依赖令牌，不依赖宿主机 `~/.codebuddy` 登录信息。
+`CODEBUDDY_API_KEY` 为认证令牌；`CODEBUDDY_BASE_URL` 可覆盖上游地址。未设置时与 CLI 一致：`CODEBUDDY_INTERNET_ENVIRONMENT=internal` 或 `ioa` 使用 `https://copilot.tencent.com/v2`，否则使用 `https://www.codebuddy.ai/v2`。该部署方式只依赖令牌，不依赖宿主机 `~/.codebuddy` 登录信息。
 
 ## Docker 部署
 
@@ -205,9 +205,9 @@ Authorization: Bearer <PROXY_API_KEY>
 | `HOST` | `127.0.0.1` | 监听地址。对外服务时改为 `0.0.0.0`，并设置 `PROXY_API_KEY`。 |
 | `PROXY_API_KEY` | 空 | 客户端 Bearer Token。生产环境必须设置。 |
 | `CODEBUDDY_API_KEY` | 必填 | CodeBuddy 认证令牌（JWT 或 API Key）。 |
-| `CODEBUDDY_BASE_URL` | `https://copilot.tencent.com/v2` | 上游地址；企业内部/其他环境覆盖此值。 |
+| `CODEBUDDY_BASE_URL` | 按 `CODEBUDDY_INTERNET_ENVIRONMENT` 决定 | 上游地址，设置后优先于环境选择。 |
 | `DEFAULT_MODEL` | `hy3` | 未指定或未知模型名时使用的模型。 |
-| `CODEBUDDY_CLI_VERSION` | `2.127.3` | 用于 `user-agent` 指纹的 CLI 版本，一般无需设置。 |
+| `CODEBUDDY_CLI_VERSION` | `2.130.0` | 用于 `X-IDE-Version` 指纹的 CLI 版本，一般无需设置。 |
 | `REQUEST_TIMEOUT_MS` | `600000` | 单请求超时（毫秒）。 |
 | `SESSION_TTL_MS` | `1800000` | 会话空闲回收时间（毫秒）。 |
 
