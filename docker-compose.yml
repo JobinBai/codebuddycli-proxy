@@ -6,10 +6,11 @@ services:
       - "${HOST_PORT:-8787}:8787"
     environment:
       CODEBUDDY_API_KEY: "${CODEBUDDY_API_KEY:?Set CODEBUDDY_API_KEY in .env}"
-      PROXY_API_KEY: "${PROXY_API_KEY:?Set PROXY_API_KEY in .env}"
-      CODEBUDDY_INTERNET_ENVIRONMENT: "${CODEBUDDY_INTERNET_ENVIRONMENT:-internal}"
-      PERSISTENT_CLIENTS: "${PERSISTENT_CLIENTS:-3}"
-      QUEUE_TIMEOUT_MS: "${QUEUE_TIMEOUT_MS:-600000}"
+      CODEBUDDY_BASE_URL: "${CODEBUDDY_BASE_URL:-https://copilot.tencent.com/v2}"
+      PROXY_API_KEY: "${PROXY_API_KEY:-}"
+      DEFAULT_MODEL: "${DEFAULT_MODEL:-hy3}"
+      REQUEST_TIMEOUT_MS: "${REQUEST_TIMEOUT_MS:-600000}"
+      SESSION_TTL_MS: "${SESSION_TTL_MS:-1800000}"
     volumes:
       - codebuddy-workspace:/app/workspace
     healthcheck:

@@ -2,7 +2,7 @@
 
 [![Docker Hub](https://img.shields.io/docker/v/jobinbai/codebuddycli-proxy?label=Docker%20Hub)](https://hub.docker.com/r/jobinbai/codebuddycli-proxy)
 
-将 CodeBuddy Agent SDK 封装为 **OpenAI Chat Completions 兼容 API**，供 Cherry Studio、OpenAI SDK、LangChain 等客户端或 Agent 接入。
+将 CodeBuddy 模型服务封装为 **OpenAI Chat Completions 兼容 API**（直连 `https://copilot.tencent.com/v2/chat/completions`，无 Agent SDK、无 CLI 子进程、零运行时依赖），供 Cherry Studio、OpenAI SDK、LangChain 等客户端或 Agent 接入。
 
 它是一个纯模型网关：服务端不执行命令、读写文件、调用 MCP 或访问数据库。若模型请求工具，代理只返回标准 OpenAI `tool_calls`；由接入该 API 的 Agent 在自己的环境中决定是否执行。
 
@@ -13,38 +13,34 @@
 - `GET /health`、`GET /v1/health`：健康检查
 - OpenAI `messages`、`system` / `developer` 消息、多轮上下文
 - OpenAI function calling / `tool_calls` 中继
-- PNG、JPEG、WebP 的 Base64 `image_url` 输入
+- 完整透传 OpenAI Chat Completions 请求参数（`temperature`、`top_p`、`n`、`max_tokens`、`stop`、`tools`、`tool_choice`、`response_format`、`logprobs`、`seed`、`user`、`reasoning_effort`、`stream_options` 等）
+- 流式 SSE 与上游返回的 `system_fingerprint` / `usage` 等字段均忠实透传
 
 不提供 `/v1/embeddings`、`/v1/responses` API。服务不保存请求正文、工具参数或模型响应。
 
 ## 安全边界
 
-每次模型请求都通过 CodeBuddy Agent SDK 的受限配置执行：
+服务以「只给令牌、直连模型服务」的方式运行，本进程内不启动任何 CLI 子进程、不执行命令、不读写文件、不接入 MCP：
 
-- 内置工具固定为 `[]`
-- MCP 固定为空配置
-- 不加载本地 CodeBuddy 设置
-- 默认常驻三个彼此隔离的 CLI worker；请求之间执行 `/clear`，不落盘保存对话会话
+- 认证令牌由环境变量 `CODEBUDDY_API_KEY` 注入；可观测性与风控请求头（X-User-Id / X-Domain / 链路追踪 / 三级会话标识）由本进程依据令牌自动生成，调用方无需关心。
+- 服务端不保存请求正文、工具参数或模型响应。
+- 若模型返回工具调用，代理只透出标准 OpenAI `tool_calls`，由接入方在自己的受控环境中决定是否执行。
 
-因此，数据库查询、Shell 命令、文件操作等工具必须由上游 Agent 接到 `tool_calls` 后在它自己的受控环境中执行。请始终设置 `PROXY_API_KEY`，并避免把服务端口直接暴露到公网。
+请始终设置 `PROXY_API_KEY` 为强随机密钥，避免把服务端口直接暴露到公网。
 
 ## 快速开始
 
-要求：Node.js 18 或更高版本，以及有效的 CodeBuddy API Key。
+要求：Node.js 18 或更高版本，以及有效的 CodeBuddy 令牌（JWT 或 API Key）。本服务**零运行时依赖**，`npm install` 可省略。
 
 ```bash
-npm install
-
-CODEBUDDY_API_KEY="你的 CodeBuddy API Key" \
-CODEBUDDY_INTERNET_ENVIRONMENT=internal \
+CODEBUDDY_API_KEY="你的 CodeBuddy 令牌" \
 PROXY_API_KEY="替换为强随机密钥" \
-PERSISTENT_CLIENTS=3 \
 node server.js
 ```
 
 服务默认监听 `http://127.0.0.1:8787`。
 
-`CODEBUDDY_INTERNET_ENVIRONMENT=internal` 用于中国版 CodeBuddy API Key；海外版不要设置，iOA 环境使用 `ioa`。该部署方式只依赖环境变量中的 API Key，不依赖宿主机 `~/.codebuddy` 的登录信息。
+`CODEBUDDY_API_KEY` 为认证令牌；`CODEBUDDY_BASE_URL` 可覆盖上游地址（默认 `https://copilot.tencent.com/v2`）。该部署方式只依赖令牌，不依赖宿主机 `~/.codebuddy` 登录信息。
 
 ## Docker 部署
 
@@ -61,10 +57,9 @@ docker run -d \
   --name codebuddycli-proxy \
   --restart unless-stopped \
   -p 8787:8787 \
-  -e CODEBUDDY_API_KEY="你的 CodeBuddy API Key" \
-  -e CODEBUDDY_INTERNET_ENVIRONMENT=internal \
+  -e CODEBUDDY_API_KEY="你的 CodeBuddy 令牌" \
   -e PROXY_API_KEY="替换为强随机密钥" \
-  -e PERSISTENT_CLIENTS=3 \
+  -e CODEBUDDY_BASE_URL="https://copilot.tencent.com/v2" \
   jobinbai/codebuddycli-proxy:latest
 ```
 
@@ -209,21 +204,16 @@ Authorization: Bearer <PROXY_API_KEY>
 | `PORT` | `8787` | HTTP 监听端口。 |
 | `HOST` | `127.0.0.1` | 监听地址。对外服务时改为 `0.0.0.0`，并设置 `PROXY_API_KEY`。 |
 | `PROXY_API_KEY` | 空 | 客户端 Bearer Token。生产环境必须设置。 |
-| `CODEBUDDY_API_KEY` | 空 | 传给 CodeBuddy SDK 的 API Key。 |
-| `CODEBUDDY_INTERNET_ENVIRONMENT` | 空 | 中国版使用 `internal`；iOA 使用 `ioa`。 |
-| `CODEBUDDY_AUTH_TOKEN` | 空 | 可选的 CodeBuddy 认证 Token。 |
-| `CODEBUDDY_BIN` | SDK 内置 CLI | 可选的 CodeBuddy CLI 绝对路径。 |
-| `DEFAULT_MODEL` | `auto` | 未知模型名时使用的模型。 |
-| `HIDE_REASONING` | `1` | 设为 `0` 时输出 `reasoning_content` 扩展字段；默认隐藏。 |
+| `CODEBUDDY_API_KEY` | 必填 | CodeBuddy 认证令牌（JWT 或 API Key）。 |
+| `CODEBUDDY_BASE_URL` | `https://copilot.tencent.com/v2` | 上游地址；企业内部/其他环境覆盖此值。 |
+| `DEFAULT_MODEL` | `hy3` | 未指定或未知模型名时使用的模型。 |
+| `CODEBUDDY_CLI_VERSION` | `2.127.3` | 用于 `user-agent` 指纹的 CLI 版本，一般无需设置。 |
 | `REQUEST_TIMEOUT_MS` | `600000` | 单请求超时（毫秒）。 |
-| `QUEUE_TIMEOUT_MS` | `600000` | 等待可用 CLI worker 的最长时间（毫秒）。 |
-| `PERSISTENT_CLIENT` | `1` | 启用持久连接池；设为 `0` 时每次请求启动一次性 CLI。 |
-| `PERSISTENT_CLIENTS` | `3` | 常驻 CLI worker 数量，允许 1–32。 |
-| `WORK_DIR` | `~/.codebuddycli-proxy/workspace` | SDK 查询工作目录。 |
+| `SESSION_TTL_MS` | `1800000` | 会话空闲回收时间（毫秒）。 |
 
-## 持久连接池与并发
+## 并发与会话
 
-服务启动时会并行预热 `PERSISTENT_CLIENTS` 个 CLI。默认三个 Agent 可同时生成；更多请求按 FIFO 排队。每个 worker 完成响应后执行 `/clear`，清理结束才重新进入可用队列。单个 worker 发生异常时只重建自身。
+服务为无状态直连代理：每个请求携带完整的模拟请求头直连上游，不维护 CLI 进程池、不落盘会话。通过 `X-Conversation-ID`（或 `x-session-id` 请求头 / `session_id` / `user` 请求字段）复用同一会话上下文；同一会话下 `X-Conversation-ID` 保持稳定，而每轮请求的 `X-Request-ID` 会轮换。
 
 `/health` 的 `persistent` 字段提供池大小、健康/可用/忙碌/清理/重建数量、排队深度，以及每个 worker 的状态、连接代次、请求数和预热耗时。请求时序日志还包含 `queue_wait_ms`、`backend_worker`、`backend_generation` 和 `backend_reused`。
 

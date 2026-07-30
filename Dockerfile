@@ -6,10 +6,10 @@ RUN chown node:node /app
 
 USER node
 
-COPY --chown=node:node package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
-
+# 直连版无运行时依赖（仅用 Node 内置模块），无需 npm install
+COPY --chown=node:node package.json ./
 COPY --chown=node:node server.js ./
+COPY --chown=node:node lib/ ./lib/
 
 RUN mkdir -p /app/workspace
 
